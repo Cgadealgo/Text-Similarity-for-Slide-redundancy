@@ -1,0 +1,113 @@
+import os
+from pdf2image import convert_from_path
+from paddleocr import PaddleOCR
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+import json
+
+# Initialize PaddleOCR
+ocr = PaddleOCR(use_angle_cls=True, lang='en')
+
+# Convert PDF to images
+def pdf_to_images(pdf_path, output_folder):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    images = convert_from_path(pdf_path)
+    image_paths = []
+    for i, image in enumerate(images):
+        image_path = os.path.join(output_folder, f"page_{i + 1}.png")
+        image.save(image_path)
+        image_paths.append(image_path)
+    return image_paths
+
+# Extract text from images
+def extract_text_from_images(image_folder):
+    text_data = {}
+    for filename in sorted(os.listdir(image_folder)):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(image_folder, filename)
+            results = ocr.ocr(image_path, cls=True)
+            
+            text = ''
+            if results and isinstance(results, list):  # Check if results are valid and a list
+                for result in results:
+                    if isinstance(result, list):  # Ensure result is a list
+                        for line in result:
+                            if len(line) > 1 and isinstance(line[1], (list, tuple)):
+                                text += line[1][0] + ' '
+            else:
+                print(f"Warning: OCR returned no results for {filename}")
+
+            slide_number = re.search(r'\d+', filename)
+            slide_number = slide_number.group() if slide_number else filename
+            text_data[slide_number] = {
+                'text': text.strip(),
+                'image_path': image_path
+            }
+    return text_data
+
+# Compute text similarity
+def compute_text_similarity(text_data):
+    slides = list(text_data.keys())
+    texts = [text_data[slide]['text'] for slide in slides]
+    
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    similarity_matrix = cosine_similarity(tfidf_matrix, tfidf_matrix)
+    
+    similarities = {}
+    for i in range(len(slides)):
+        for j in range(i + 1, len(slides)):
+            similarities[(slides[i], slides[j])] = similarity_matrix[i, j]
+    
+    return similarities
+
+# Log all pair similarities and list images to be deleted
+def log_and_list_similar_images(text_data, similarities, similarity_threshold):
+    flagged_images = set()
+    output_data = {"pairs": [], "flagged_images": []}
+    
+    for (slide1, slide2), similarity in similarities.items():
+        # Skip pairs where either slide is already flagged
+        if slide1 in flagged_images or slide2 in flagged_images:
+            continue
+
+        flagged_image = ""
+        if similarity > similarity_threshold:
+            # Mark one of the images for flagging
+            flagged_image = slide2
+            flagged_images.add(flagged_image)
+
+        # Add pair information to output data
+        output_data["pairs"].append({
+            "slide1": slide1,
+            "slide2": slide2,
+            "similarity": similarity,
+            "flagged_image": text_data[slide2]['image_path'] if flagged_image == slide2 else None
+        })
+    
+    # Add flagged images to output data
+    output_data["flagged_images"] = list(flagged_images)
+    return output_data
+
+# Main process
+def process_pdf(pdf_path, output_folder, output_json_path, similarity_threshold=0.97):
+    # Convert PDF to images
+    pdf_to_images(pdf_path, output_folder)
+    
+    # Extract text from images
+    text_data = extract_text_from_images(output_folder)
+    
+    # Compute text similarity
+    similarities = compute_text_similarity(text_data)
+    
+    # Log all pairs and list flagged images
+    output_data = log_and_list_similar_images(text_data, similarities, similarity_threshold)
+
+    # Save output data to JSON
+    with open(output_json_path, 'w') as json_file:
+        json.dump(output_data, json_file, indent=4)
+
+    print(f"Process completed. Results saved to {output_json_path}.")
+
